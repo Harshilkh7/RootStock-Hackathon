@@ -67,9 +67,22 @@ def run_server(port: int):
         server.server_close()
 
 
-def run_cli(query: str):
+def run_cli(query: str, export_format: str | None = None, export_path: str | None = None):
     engine = ResearchEngine.from_path(DATA_DIR / "corpus.json")
     result = engine.run(query)
+    if export_format:
+        payload_by_format = {
+            "markdown": result["report_markdown"],
+            "html": result["report_html"],
+            "json": json.dumps(result, indent=2),
+        }
+        body = payload_by_format[export_format]
+        if export_path:
+            Path(export_path).write_text(body, encoding="utf-8")
+            print(f"Saved {export_format} report to {export_path}")
+        else:
+            print(body)
+        return
     print(result["report_markdown"])
 
 
@@ -77,12 +90,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Rootstock Hackathon research engine prototype")
     parser.add_argument("--port", type=int, default=8000, help="Local server port")
     parser.add_argument("--query", type=str, help="Run a one-off CLI research query")
+    parser.add_argument(
+        "--export-format",
+        choices=["markdown", "html", "json"],
+        help="Export CLI output in the selected format",
+    )
+    parser.add_argument("--export-path", type=str, help="Optional output path for exported report")
     return parser
 
 
 if __name__ == "__main__":
     args = build_parser().parse_args()
     if args.query:
-        run_cli(args.query)
+        run_cli(args.query, args.export_format, args.export_path)
     else:
         run_server(args.port)

@@ -5,6 +5,7 @@ import math
 import re
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
+from html import escape
 from pathlib import Path
 from typing import Iterable
 
@@ -108,6 +109,8 @@ class EvidenceItem:
     source_url: str
     chunk_id: str
     confidence: float
+    support_count: int
+    verification: str
     contradiction_flag: bool
 
 
@@ -148,18 +151,72 @@ class ResearchEngine:
         plan = self._build_plan(query)
         generated_queries = self._expand_queries(query, plan)
         ranked_chunks = self._rank_chunks(query, generated_queries)
-        top_chunks = ranked_chunks[:8]
+        ranked_chunks, generated_queries, iterative_trace = self._iterative_research(query, ranked_chunks, generated_queries)
+        top_chunks = ranked_chunks[:10]
         evidence = self._extract_evidence(query, plan, top_chunks)
-        report = self._generate_report(query, plan, top_chunks, evidence)
+        report = self._generate_report(query, plan, generated_queries, iterative_trace, top_chunks, evidence)
         sources = self._build_source_table(top_chunks)
         return {
             "query": query,
             "research_plan": plan,
             "generated_queries": generated_queries,
+            "iterative_trace": iterative_trace,
             "sources": sources,
             "evidence": [asdict(item) for item in evidence],
             "report_markdown": report,
+            "report_html": self._to_html_report(query, report),
         }
+
+    def _iterative_research(
+        self, query: str, ranked_chunks: list[RankedChunk], generated_queries: list[str]
+    ) -> tuple[list[RankedChunk], list[str], list[dict]]:
+        initial_top = ranked_chunks[:6]
+        follow_ups = []
+
+        text_blob = " ".join(chunk.chunk.text.lower() for chunk in initial_top)
+        coverage_terms = {
+            "ventilation": ["ventilation", "window", "airflow", "outdoor air"],
+            "filtration": ["filter", "filtration", "merv", "hepa", "cleaner"],
+            "monitoring": ["monitor", "sensor", "co2", "measurement", "maintenance"],
+        }
+        missing_dimensions = [
+            name
+            for name, terms in coverage_terms.items()
+            if not any(term in text_blob for term in terms)
+        ]
+
+        avg_grounding = average(chunk.grounding for chunk in initial_top)
+        if missing_dimensions:
+            follow_ups.append(
+                f"{query} focused comparison for {' '.join(missing_dimensions)} in classrooms with practical implementation details"
+            )
+        if avg_grounding < 0.22:
+            follow_ups.append(
+                f"{query} include quantified impact cost and maintenance evidence with specific metrics"
+            )
+
+        trace = [
+            {
+                "iteration": 1,
+                "note": "Initial retrieval completed from base and expanded queries.",
+                "added_queries": [],
+                "avg_grounding": round(avg_grounding, 3),
+            }
+        ]
+        if not follow_ups:
+            return ranked_chunks, generated_queries, trace
+
+        updated_queries = generated_queries + follow_ups
+        reranked = self._rank_chunks(query, updated_queries)
+        trace.append(
+            {
+                "iteration": 2,
+                "note": "Gap-driven follow-up retrieval executed to fill weak coverage.",
+                "added_queries": follow_ups,
+                "avg_grounding": round(average(chunk.grounding for chunk in reranked[:6]), 3),
+            }
+        )
+        return reranked, updated_queries, trace
 
     def _build_plan(self, query: str) -> list[str]:
         core = normalize_whitespace(query.rstrip("?. "))
@@ -344,7 +401,10 @@ class ResearchEngine:
     def _extract_evidence(self, query: str, plan: list[str], ranked_chunks: list[RankedChunk]) -> list[EvidenceItem]:
         evidence = []
         query_tokens = set(tokenize(query + " " + " ".join(plan)))
-        for ranked in ranked_chunks[:5]:
+        grouped_support = defaultdict(set)
+        grouped_contradiction = defaultdict(bool)
+        chosen_sentences = []
+        for ranked in ranked_chunks[:8]:
             best_sentence = ""
             best_overlap = -1
             for sentence in split_sentences(ranked.chunk.text):
@@ -355,9 +415,21 @@ class ResearchEngine:
                     best_overlap = overlap
             if not best_sentence:
                 continue
+            signature = self._claim_signature(best_sentence)
+            grouped_support[signature].add(ranked.chunk.doc_id)
+            grouped_contradiction[signature] = grouped_contradiction[signature] or self._sentence_has_contradiction(best_sentence)
+            chosen_sentences.append((ranked, best_sentence, signature))
+
+        for ranked, best_sentence, signature in chosen_sentences[:6]:
             claim = self._claim_from_sentence(best_sentence)
-            contradiction_flag = self._sentence_has_contradiction(best_sentence)
-            confidence = min(0.99, ranked.vgrh_score * (0.82 if contradiction_flag else 1.0))
+            contradiction_flag = grouped_contradiction[signature]
+            support_count = len(grouped_support[signature])
+            verification = "verified" if support_count >= 2 and not contradiction_flag else "needs_review"
+            confidence = ranked.vgrh_score
+            confidence += min(0.09, support_count * 0.03)
+            if contradiction_flag:
+                confidence *= 0.82
+            confidence = min(0.99, confidence)
             evidence.append(
                 EvidenceItem(
                     claim=claim,
@@ -366,6 +438,8 @@ class ResearchEngine:
                     source_url=ranked.chunk.url,
                     chunk_id=ranked.chunk.chunk_id,
                     confidence=round(confidence, 3),
+                    support_count=support_count,
+                    verification=verification,
                     contradiction_flag=contradiction_flag,
                 )
             )
@@ -377,7 +451,29 @@ class ResearchEngine:
 
     def _sentence_has_contradiction(self, sentence: str) -> bool:
         lowered = sentence.lower()
-        return "however" in lowered or "may not" in lowered or "limited" in lowered
+        contradiction_terms = [
+            "however",
+            "may not",
+            "limited",
+            "uncertain",
+            "inconclusive",
+            "conflicting",
+        ]
+        return any(term in lowered for term in contradiction_terms)
+
+    def _claim_signature(self, sentence: str) -> str:
+        lowered = sentence.lower()
+        concept_groups = {
+            "ventilation_action": ["ventilation", "window", "airflow", "outdoor air", "fresh air"],
+            "filtration_action": ["filter", "filtration", "hepa", "merv", "cleaner", "purifier"],
+            "monitoring_action": ["monitor", "sensor", "co2", "measurement", "maintenance"],
+            "source_control_action": ["source control", "idling", "pollutant", "emission", "chemical", "moisture"],
+        }
+        for signature, terms in concept_groups.items():
+            if any(term in lowered for term in terms):
+                return signature
+        tokens = [token for token in tokenize(sentence) if len(token) > 3]
+        return " ".join(tokens[:7]) if tokens else sentence[:32].lower()
 
     def _build_source_table(self, ranked_chunks: list[RankedChunk]) -> list[dict]:
         best_by_doc = {}
@@ -409,7 +505,15 @@ class ResearchEngine:
             )
         return sources
 
-    def _generate_report(self, query: str, plan: list[str], ranked_chunks: list[RankedChunk], evidence: list[EvidenceItem]) -> str:
+    def _generate_report(
+        self,
+        query: str,
+        plan: list[str],
+        generated_queries: list[str],
+        iterative_trace: list[dict],
+        ranked_chunks: list[RankedChunk],
+        evidence: list[EvidenceItem],
+    ) -> str:
         source_lines = []
         for index, ranked in enumerate(ranked_chunks[:5], start=1):
             source_lines.append(
@@ -421,11 +525,17 @@ class ResearchEngine:
         evidence_lines = []
         for item in evidence:
             evidence_lines.append(
-                f"| {item.claim} | {item.snippet} | [{item.source_title}]({item.source_url}) | {item.confidence:.2f} |"
+                f"| {item.claim} | {item.snippet} | [{item.source_title}]({item.source_url}) | {item.confidence:.2f} | {item.support_count} | {item.verification} |"
             )
 
         recommendation_block = self._build_recommendations(evidence)
         limitations = self._build_limitations(ranked_chunks, evidence)
+        trace_lines = []
+        for item in iterative_trace:
+            added = ", ".join(item["added_queries"]) if item["added_queries"] else "None"
+            trace_lines.append(
+                f"- Iteration {item['iteration']}: {item['note']} (avg grounding {item['avg_grounding']:.2f}, added queries: {added})"
+            )
 
         return "\n".join(
             [
@@ -442,9 +552,15 @@ class ResearchEngine:
                 "| --- | --- | --- | --- | --- | --- |",
                 *source_lines,
                 "",
+                "## Iterative Research Loop",
+                *trace_lines,
+                "",
+                "## Retrieval Queries Used",
+                *[f"- {item}" for item in generated_queries],
+                "",
                 "## Evidence Table",
-                "| Claim | Evidence Snippet | Source Reference | Confidence |",
-                "| --- | --- | --- | --- |",
+                "| Claim | Evidence Snippet | Source Reference | Confidence | Multi-Source Support | Verification |",
+                "| --- | --- | --- | --- | --- | --- |",
                 *evidence_lines,
                 "",
                 "## Final Report",
@@ -512,7 +628,7 @@ class ResearchEngine:
         bullets = []
         for label, item in method_evidence[:3]:
             bullets.append(
-                f"- **{label}:** {item.claim} ({item.confidence:.2f} confidence, "
+                f"- **{label}:** {item.claim} ({item.confidence:.2f} confidence, {item.verification}, "
                 f"[{item.source_title}]({item.source_url}))"
             )
         report = "\n".join(
@@ -539,3 +655,13 @@ class ResearchEngine:
         if any(item.contradiction_flag for item in evidence):
             notes.append("At least one evidence item includes uncertainty language and should be reviewed manually before acting on it.")
         return "\n".join(f"- {note}" for note in notes)
+
+    def _to_html_report(self, query: str, markdown_report: str) -> str:
+        escaped_report = escape(markdown_report)
+        escaped_query = escape(query)
+        return (
+            "<!doctype html><html><head><meta charset='utf-8'><title>Research Report</title>"
+            "<style>body{font-family:Arial,sans-serif;max-width:980px;margin:24px auto;padding:0 16px;line-height:1.5}"
+            "pre{white-space:pre-wrap;background:#f6f8fa;border:1px solid #d0d7de;border-radius:8px;padding:16px}</style>"
+            f"</head><body><h1>Research Report</h1><h2>{escaped_query}</h2><pre>{escaped_report}</pre></body></html>"
+        )
