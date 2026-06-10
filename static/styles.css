@@ -112,6 +112,11 @@ button:disabled {
   cursor: wait;
 }
 
+#downloadMarkdownButton,
+#downloadHtmlButton {
+  background: linear-gradient(135deg, var(--accent-2), #4f9d82);
+}
+
 #status {
   color: var(--muted);
 }
@@ -162,6 +167,11 @@ button:disabled {
 
 a {
   color: var(--accent-2);
+}
+
+#loopTrace {
+  margin: 0;
+  padding-left: 22px;
 }
 
 @media (max-width: 900px) {

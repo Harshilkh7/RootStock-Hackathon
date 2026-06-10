@@ -5,8 +5,12 @@ import math
 import re
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from html import escape
 from pathlib import Path
 from typing import Iterable
+from urllib.parse import quote, quote_plus, urlparse
+from urllib.request import Request, urlopen
 
 
 STOPWORDS = {
@@ -61,6 +65,36 @@ TRUST_SCORES = {
     "prepared.local": 0.75,
 }
 
+MIN_GROUNDING_THRESHOLD = 0.22
+MAX_SUPPORT_CONFIDENCE_BONUS = 0.09
+SUPPORT_CONFIDENCE_STEP = 0.03
+SUPPORT_SIMILARITY_THRESHOLD = 0.08
+CLAIM_SIGNATURE_MIN_TOKEN_LENGTH = 3
+CLAIM_SIGNATURE_TOKEN_LIMIT = 7
+CLAIM_SIGNATURE_FALLBACK_CHARS = 32
+LIVE_SEARCH_TIMEOUT_SECONDS = 8
+LIVE_DDG_RESULT_LIMIT = 5
+LIVE_WIKI_RESULT_LIMIT = 4
+GENERIC_QUERY_TERMS = {
+    "compare",
+    "method",
+    "methods",
+    "study",
+    "analysis",
+    "research",
+    "one",
+    "two",
+    "three",
+    "four",
+    "five",
+    "six",
+    "seven",
+    "eight",
+    "nine",
+    "ten",
+}
+EXPANSION_CONTEXT_TERMS = ("evidence", "analysis", "results", "data", "metrics")
+
 
 @dataclass
 class Document:
@@ -108,6 +142,8 @@ class EvidenceItem:
     source_url: str
     chunk_id: str
     confidence: float
+    support_count: int
+    verification: str
     contradiction_flag: bool
 
 
@@ -145,21 +181,192 @@ class ResearchEngine:
         return cls(documents)
 
     def run(self, query: str) -> dict:
+        live_documents = self._fetch_live_documents(query)
+        runtime_engine = self if not live_documents else ResearchEngine(self.documents + live_documents)
+        result = runtime_engine._run_pipeline(query)
+        result["live_documents_count"] = len(live_documents)
+        return result
+
+    def _run_pipeline(self, query: str) -> dict:
         plan = self._build_plan(query)
         generated_queries = self._expand_queries(query, plan)
         ranked_chunks = self._rank_chunks(query, generated_queries)
-        top_chunks = ranked_chunks[:8]
+        ranked_chunks, generated_queries, iterative_trace = self._iterative_research(query, ranked_chunks, generated_queries)
+        top_chunks = ranked_chunks[:10]
         evidence = self._extract_evidence(query, plan, top_chunks)
-        report = self._generate_report(query, plan, top_chunks, evidence)
+        report = self._generate_report(query, plan, generated_queries, iterative_trace, top_chunks, evidence)
         sources = self._build_source_table(top_chunks)
         return {
             "query": query,
             "research_plan": plan,
             "generated_queries": generated_queries,
+            "iterative_trace": iterative_trace,
             "sources": sources,
             "evidence": [asdict(item) for item in evidence],
             "report_markdown": report,
+            "report_html": self._to_html_report(query, report),
         }
+
+    def _fetch_live_documents(self, query: str) -> list[Document]:
+        live_documents = []
+        live_documents.extend(self._fetch_duckduckgo_documents(query))
+        live_documents.extend(self._fetch_wikipedia_documents(query))
+        deduped_by_url = {}
+        for document in live_documents:
+            if len(tokenize(document.text)) < 10:
+                continue
+            deduped_by_url.setdefault(document.url, document)
+        return list(deduped_by_url.values())
+
+    def _fetch_duckduckgo_documents(self, query: str) -> list[Document]:
+        endpoint = (
+            "https://api.duckduckgo.com/"
+            f"?q={quote_plus(query)}&format=json&no_html=1&skip_disambig=1"
+        )
+        payload = self._get_json(endpoint)
+        if not payload:
+            return []
+
+        candidates = []
+        if payload.get("AbstractURL") and payload.get("AbstractText"):
+            candidates.append(
+                {
+                    "title": payload.get("Heading") or payload.get("AbstractSource") or "DuckDuckGo result",
+                    "url": payload["AbstractURL"],
+                    "snippet": payload["AbstractText"],
+                }
+            )
+        for item in payload.get("RelatedTopics", []):
+            if isinstance(item, dict) and item.get("Topics"):
+                topic_items = item.get("Topics", [])
+            else:
+                topic_items = [item]
+            for topic in topic_items:
+                if not isinstance(topic, dict):
+                    continue
+                url = topic.get("FirstURL")
+                text = topic.get("Text")
+                if not url or not text:
+                    continue
+                title = text.split(" - ", 1)[0].strip() or "DuckDuckGo related result"
+                candidates.append({"title": title, "url": url, "snippet": text})
+
+        documents = []
+        for index, item in enumerate(candidates[:LIVE_DDG_RESULT_LIMIT], start=1):
+            publisher = self._domain_from_url(item["url"]) or "duckduckgo.com"
+            documents.append(
+                Document(
+                    doc_id=f"live-ddg-{index}",
+                    title=normalize_whitespace(item["title"]),
+                    url=item["url"],
+                    source_type="web_api",
+                    publisher=publisher,
+                    published_at=self._live_timestamp_label(),
+                    text=normalize_whitespace(f"{item['title']}. {item['snippet']}"),
+                )
+            )
+        return documents
+
+    def _fetch_wikipedia_documents(self, query: str) -> list[Document]:
+        search_url = (
+            "https://en.wikipedia.org/w/api.php?action=query&list=search&utf8=1&format=json"
+            f"&srlimit={LIVE_WIKI_RESULT_LIMIT}&srsearch={quote_plus(query)}"
+        )
+        payload = self._get_json(search_url)
+        search_items = ((payload or {}).get("query") or {}).get("search") or []
+        documents = []
+        for index, item in enumerate(search_items, start=1):
+            title = normalize_whitespace(str(item.get("title", "")).strip())
+            if not title:
+                continue
+            summary = self._get_json(f"https://en.wikipedia.org/api/rest_v1/page/summary/{quote(title, safe='')}")
+            snippet = normalize_whitespace(self._strip_html(str(item.get("snippet", ""))))
+            extract = normalize_whitespace(str((summary or {}).get("extract", "")).strip())
+            text = normalize_whitespace(f"{title}. {extract or snippet}")
+            url = ((summary or {}).get("content_urls") or {}).get("desktop", {}).get("page")
+            if not url:
+                url = f"https://en.wikipedia.org/wiki/{quote(title.replace(' ', '_'), safe='')}"
+            published_at = str((summary or {}).get("timestamp", "")).split("T", 1)[0] or self._live_timestamp_label()
+            documents.append(
+                Document(
+                    doc_id=f"live-wiki-{index}",
+                    title=title,
+                    url=url,
+                    source_type="web_api",
+                    publisher="wikipedia.org",
+                    published_at=published_at,
+                    text=text,
+                )
+            )
+        return documents
+
+    def _get_json(self, url: str) -> dict | None:
+        try:
+            request = Request(url, headers={"User-Agent": "RootstockResearchEngine/1.0"})
+            with urlopen(request, timeout=LIVE_SEARCH_TIMEOUT_SECONDS) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except Exception:
+            return None
+
+    def _domain_from_url(self, url: str) -> str:
+        domain = urlparse(url).netloc.lower().removeprefix("www.")
+        return domain
+
+    def _live_timestamp_label(self) -> str:
+        return datetime.now(timezone.utc).date().isoformat()
+
+    def _strip_html(self, text: str) -> str:
+        return re.sub(r"<[^>]+>", " ", text)
+
+    def _iterative_research(
+        self, query: str, ranked_chunks: list[RankedChunk], generated_queries: list[str]
+    ) -> tuple[list[RankedChunk], list[str], list[dict]]:
+        initial_top = ranked_chunks[:6]
+        follow_ups = []
+
+        text_blob = " ".join(chunk.chunk.text.lower() for chunk in initial_top)
+        focus_terms = []
+        for token in tokenize(query):
+            cleaned = token.strip(".-")
+            if len(cleaned) <= CLAIM_SIGNATURE_MIN_TOKEN_LENGTH or cleaned in GENERIC_QUERY_TERMS:
+                continue
+            focus_terms.append(cleaned)
+            if len(focus_terms) == 8:
+                break
+        missing_dimensions = [term for term in focus_terms if term not in text_blob]
+
+        avg_grounding = average(chunk.grounding for chunk in initial_top)
+        if missing_dimensions:
+            follow_ups.append(
+                f"{query} focused analysis for {' '.join(missing_dimensions)} with additional context"
+            )
+        if avg_grounding < MIN_GROUNDING_THRESHOLD:
+            follow_ups.append(
+                f"{query} include quantified evidence with specific metrics"
+            )
+
+        trace = [
+            {
+                "iteration": 1,
+                "note": "Initial retrieval completed from base and expanded queries.",
+                "added_queries": [],
+                "avg_grounding": round(avg_grounding, 3),
+            }
+        ]
+        if not follow_ups:
+            return ranked_chunks, generated_queries, trace
+
+        updated_queries = generated_queries + follow_ups
+        reranked = self._rank_chunks(query, updated_queries)
+        trace.append(
+            {
+                "iteration": 2,
+                "note": "Gap-driven follow-up retrieval executed to fill weak coverage.",
+                "added_queries": follow_ups,
+                "avg_grounding": round(average(chunk.grounding for chunk in reranked[:6]), 3),
+            }
+        )
+        return reranked, updated_queries, trace
 
     def _build_plan(self, query: str) -> list[str]:
         core = normalize_whitespace(query.rstrip("?. "))
@@ -179,7 +386,7 @@ class ResearchEngine:
         return [
             query,
             joined,
-            f"{query} evidence cost classroom ventilation filtration monitoring",
+            f"{query} {' '.join(EXPANSION_CONTEXT_TERMS)}",
             f"{plan[1]} {plan[2]}",
         ]
 
@@ -344,7 +551,8 @@ class ResearchEngine:
     def _extract_evidence(self, query: str, plan: list[str], ranked_chunks: list[RankedChunk]) -> list[EvidenceItem]:
         evidence = []
         query_tokens = set(tokenize(query + " " + " ".join(plan)))
-        for ranked in ranked_chunks[:5]:
+        chosen_sentences = []
+        for ranked in ranked_chunks[:8]:
             best_sentence = ""
             best_overlap = -1
             for sentence in split_sentences(ranked.chunk.text):
@@ -355,9 +563,27 @@ class ResearchEngine:
                     best_overlap = overlap
             if not best_sentence:
                 continue
+            signature = self._claim_signature(best_sentence, query_tokens)
+            sentence_token_set = set(self._normalize_token_for_signature(token) for token in tokenize(best_sentence))
+            chosen_sentences.append((ranked, best_sentence, signature, sentence_token_set))
+
+        for ranked, best_sentence, signature, sentence_token_set in chosen_sentences[:6]:
             claim = self._claim_from_sentence(best_sentence)
-            contradiction_flag = self._sentence_has_contradiction(best_sentence)
-            confidence = min(0.99, ranked.vgrh_score * (0.82 if contradiction_flag else 1.0))
+            support_docs = set()
+            contradiction_flag = False
+            for other_ranked, other_sentence, other_signature, other_token_set in chosen_sentences:
+                union = sentence_token_set | other_token_set
+                similarity = (len(sentence_token_set & other_token_set) / len(union)) if union else 0.0
+                if signature == other_signature or similarity >= SUPPORT_SIMILARITY_THRESHOLD:
+                    support_docs.add(other_ranked.chunk.doc_id)
+                    contradiction_flag = contradiction_flag or self._sentence_has_contradiction(other_sentence)
+            support_count = len(support_docs)
+            verification = "verified" if support_count >= 2 and not contradiction_flag else "needs_review"
+            confidence = ranked.vgrh_score
+            confidence += min(MAX_SUPPORT_CONFIDENCE_BONUS, support_count * SUPPORT_CONFIDENCE_STEP)
+            if contradiction_flag:
+                confidence *= 0.82
+            confidence = min(0.99, confidence)
             evidence.append(
                 EvidenceItem(
                     claim=claim,
@@ -366,6 +592,8 @@ class ResearchEngine:
                     source_url=ranked.chunk.url,
                     chunk_id=ranked.chunk.chunk_id,
                     confidence=round(confidence, 3),
+                    support_count=support_count,
+                    verification=verification,
                     contradiction_flag=contradiction_flag,
                 )
             )
@@ -377,7 +605,39 @@ class ResearchEngine:
 
     def _sentence_has_contradiction(self, sentence: str) -> bool:
         lowered = sentence.lower()
-        return "however" in lowered or "may not" in lowered or "limited" in lowered
+        contradiction_terms = [
+            "however",
+            "may not",
+            "limited",
+            "uncertain",
+            "inconclusive",
+            "conflicting",
+        ]
+        return any(term in lowered for term in contradiction_terms)
+
+    def _claim_signature(self, sentence: str, query_tokens: set[str] | None = None) -> str:
+        tokens = [self._normalize_token_for_signature(token) for token in tokenize(sentence)]
+        tokens = [token for token in tokens if len(token) > CLAIM_SIGNATURE_MIN_TOKEN_LENGTH and token not in GENERIC_QUERY_TERMS]
+        if query_tokens:
+            anchored = sorted(set(tokens) & query_tokens)
+            if len(anchored) >= 2:
+                return " ".join(anchored[:CLAIM_SIGNATURE_TOKEN_LIMIT])
+        signature_tokens = sorted(set(tokens))
+        return (
+            " ".join(signature_tokens[:CLAIM_SIGNATURE_TOKEN_LIMIT])
+            if signature_tokens
+            else sentence[:CLAIM_SIGNATURE_FALLBACK_CHARS].lower()
+        )
+
+    def _normalize_token_for_signature(self, token: str) -> str:
+        token = token.strip(".-")
+        if token.endswith("ing") and len(token) > 6:
+            return token[:-3]
+        if token.endswith("es") and len(token) > 5:
+            return token[:-2]
+        if token.endswith("s") and len(token) > 4:
+            return token[:-1]
+        return token
 
     def _build_source_table(self, ranked_chunks: list[RankedChunk]) -> list[dict]:
         best_by_doc = {}
@@ -409,7 +669,15 @@ class ResearchEngine:
             )
         return sources
 
-    def _generate_report(self, query: str, plan: list[str], ranked_chunks: list[RankedChunk], evidence: list[EvidenceItem]) -> str:
+    def _generate_report(
+        self,
+        query: str,
+        plan: list[str],
+        generated_queries: list[str],
+        iterative_trace: list[dict],
+        ranked_chunks: list[RankedChunk],
+        evidence: list[EvidenceItem],
+    ) -> str:
         source_lines = []
         for index, ranked in enumerate(ranked_chunks[:5], start=1):
             source_lines.append(
@@ -421,11 +689,17 @@ class ResearchEngine:
         evidence_lines = []
         for item in evidence:
             evidence_lines.append(
-                f"| {item.claim} | {item.snippet} | [{item.source_title}]({item.source_url}) | {item.confidence:.2f} |"
+                f"| {item.claim} | {item.snippet} | [{item.source_title}]({item.source_url}) | {item.confidence:.2f} | {item.support_count} | {item.verification} |"
             )
 
         recommendation_block = self._build_recommendations(evidence)
         limitations = self._build_limitations(ranked_chunks, evidence)
+        trace_lines = []
+        for item in iterative_trace:
+            added = ", ".join(item["added_queries"]) if item["added_queries"] else "None"
+            trace_lines.append(
+                f"- Iteration {item['iteration']}: {item['note']} (avg grounding {item['avg_grounding']:.2f}, added queries: {added})"
+            )
 
         return "\n".join(
             [
@@ -442,9 +716,15 @@ class ResearchEngine:
                 "| --- | --- | --- | --- | --- | --- |",
                 *source_lines,
                 "",
+                "## Iterative Research Loop",
+                *trace_lines,
+                "",
+                "## Retrieval Queries Used",
+                *[f"- {item}" for item in generated_queries],
+                "",
                 "## Evidence Table",
-                "| Claim | Evidence Snippet | Source Reference | Confidence |",
-                "| --- | --- | --- | --- |",
+                "| Claim | Evidence Snippet | Source Reference | Confidence | Multi-Source Support | Verification |",
+                "| --- | --- | --- | --- | --- | --- |",
                 *evidence_lines,
                 "",
                 "## Final Report",
@@ -512,7 +792,7 @@ class ResearchEngine:
         bullets = []
         for label, item in method_evidence[:3]:
             bullets.append(
-                f"- **{label}:** {item.claim} ({item.confidence:.2f} confidence, "
+                f"- **{label}:** {item.claim} ({item.confidence:.2f} confidence, {item.verification}, "
                 f"[{item.source_title}]({item.source_url}))"
             )
         report = "\n".join(
@@ -531,7 +811,7 @@ class ResearchEngine:
     def _build_limitations(self, ranked_chunks: list[RankedChunk], evidence: list[EvidenceItem]) -> str:
         missing_pdf = not any(chunk.chunk.source_type.lower() == "pdf" for chunk in ranked_chunks)
         notes = [
-            "This offline prototype searches a prepared dataset, so source recall is limited to the bundled corpus.",
+            "Live web-search APIs are queried at runtime, but retrieval is best-effort and can degrade to local-corpus-only when external APIs are unavailable or rate-limited.",
             "Claim verification is heuristic: it estimates confidence and contradiction risk from evidence overlap rather than using a second external fact-checking system.",
         ]
         if missing_pdf:
@@ -539,3 +819,89 @@ class ResearchEngine:
         if any(item.contradiction_flag for item in evidence):
             notes.append("At least one evidence item includes uncertainty language and should be reviewed manually before acting on it.")
         return "\n".join(f"- {note}" for note in notes)
+
+    def _to_html_report(self, query: str, markdown_report: str) -> str:
+        rendered = self._markdown_to_html(markdown_report)
+        escaped_query = escape(query)
+        return (
+            "<!doctype html><html><head><meta charset='utf-8'><title>Research Report</title>"
+            "<style>body{font-family:Arial,sans-serif;max-width:980px;margin:24px auto;padding:0 16px;line-height:1.5}"
+            "table{border-collapse:collapse;width:100%;margin:10px 0}th,td{border:1px solid #d0d7de;padding:8px;text-align:left}"
+            "code{background:#f6f8fa;padding:2px 4px;border-radius:4px}</style>"
+            f"</head><body><h1>Research Report</h1><h2>{escaped_query}</h2>{rendered}</body></html>"
+        )
+
+    def _markdown_to_html(self, markdown_text: str) -> str:
+        lines = markdown_text.splitlines()
+        output = []
+        in_list = False
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            stripped = line.strip()
+            if not stripped:
+                if in_list:
+                    output.append("</ul>")
+                    in_list = False
+                i += 1
+                continue
+
+            if stripped.startswith("|") and i + 1 < len(lines) and lines[i + 1].strip().startswith("| ---"):
+                if in_list:
+                    output.append("</ul>")
+                    in_list = False
+                headers = [self._render_markdown_inline(cell.strip()) for cell in stripped.strip("|").split("|")]
+                output.append("<table><thead><tr>" + "".join(f"<th>{cell}</th>" for cell in headers) + "</tr></thead><tbody>")
+                i += 2
+                while i < len(lines) and lines[i].strip().startswith("|"):
+                    cells = [self._render_markdown_inline(cell.strip()) for cell in lines[i].strip().strip("|").split("|")]
+                    output.append("<tr>" + "".join(f"<td>{cell}</td>" for cell in cells) + "</tr>")
+                    i += 1
+                output.append("</tbody></table>")
+                continue
+
+            if stripped.startswith("### "):
+                if in_list:
+                    output.append("</ul>")
+                    in_list = False
+                output.append(f"<h3>{escape(stripped[4:])}</h3>")
+            elif stripped.startswith("## "):
+                if in_list:
+                    output.append("</ul>")
+                    in_list = False
+                output.append(f"<h2>{escape(stripped[3:])}</h2>")
+            elif stripped.startswith("# "):
+                if in_list:
+                    output.append("</ul>")
+                    in_list = False
+                output.append(f"<h1>{escape(stripped[2:])}</h1>")
+            elif stripped.startswith("- "):
+                if not in_list:
+                    output.append("<ul>")
+                    in_list = True
+                output.append(f"<li>{self._render_markdown_inline(stripped[2:])}</li>")
+            else:
+                if in_list:
+                    output.append("</ul>")
+                    in_list = False
+                output.append(f"<p>{self._render_markdown_inline(stripped)}</p>")
+            i += 1
+
+        if in_list:
+            output.append("</ul>")
+        return "".join(output)
+
+    def _render_markdown_inline(self, text: str) -> str:
+        parts = []
+        last_index = 0
+        for match in re.finditer(r"\[([^\]]+)\]\((https?://[^)]+)\)", text):
+            start, end = match.span()
+            if start > last_index:
+                parts.append(escape(text[last_index:start]))
+            label = escape(match.group(1))
+            href = escape(match.group(2), quote=True)
+            parts.append(f"<a href=\"{href}\" target=\"_blank\" rel=\"noreferrer\">{label}</a>")
+            last_index = end
+        if last_index < len(text):
+            parts.append(escape(text[last_index:]))
+        return "".join(parts)
