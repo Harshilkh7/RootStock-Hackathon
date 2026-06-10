@@ -261,7 +261,7 @@ class ResearchEngine:
         return [
             query,
             joined,
-            f"{query} evidence cost classroom ventilation filtration monitoring",
+            f"{query} evidence impact cost implementation metrics",
             f"{plan[1]} {plan[2]}",
         ]
 

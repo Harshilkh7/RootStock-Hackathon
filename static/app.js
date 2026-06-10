@@ -132,4 +132,3 @@ downloadHtmlButton.addEventListener("click", () => {
   }
   downloadTextFile("research-report.html", latestResult.report_html, "text/html;charset=utf-8");
 });
-window.addEventListener("load", runResearch);
