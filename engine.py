@@ -87,6 +87,7 @@ GENERIC_QUERY_TERMS = {
     "nine",
     "ten",
 }
+EXPANSION_CONTEXT_TERMS = ("evidence", "analysis", "results", "data", "metrics")
 
 
 @dataclass
@@ -213,11 +214,11 @@ class ResearchEngine:
         avg_grounding = average(chunk.grounding for chunk in initial_top)
         if missing_dimensions:
             follow_ups.append(
-                f"{query} focused comparison for {' '.join(missing_dimensions)} with practical implementation details"
+                f"{query} focused analysis for {' '.join(missing_dimensions)} with additional context"
             )
         if avg_grounding < MIN_GROUNDING_THRESHOLD:
             follow_ups.append(
-                f"{query} include quantified impact cost and maintenance evidence with specific metrics"
+                f"{query} include quantified evidence with specific metrics"
             )
 
         trace = [
@@ -261,7 +262,7 @@ class ResearchEngine:
         return [
             query,
             joined,
-            f"{query} evidence impact cost implementation metrics",
+            f"{query} {' '.join(EXPANSION_CONTEXT_TERMS)}",
             f"{plan[1]} {plan[2]}",
         ]
 
