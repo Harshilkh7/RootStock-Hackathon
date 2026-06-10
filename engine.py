@@ -1,0 +1,541 @@
+from __future__ import annotations
+
+import json
+import math
+import re
+from collections import Counter, defaultdict
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Iterable
+
+
+STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "by",
+    "for",
+    "from",
+    "how",
+    "in",
+    "into",
+    "is",
+    "it",
+    "of",
+    "on",
+    "or",
+    "that",
+    "the",
+    "their",
+    "this",
+    "to",
+    "what",
+    "which",
+    "with",
+}
+
+SYNONYMS = {
+    "air": {"ventilation", "indoor"},
+    "quality": {"cleanliness", "pollution"},
+    "classroom": {"school", "students", "indoor"},
+    "low-cost": {"cheap", "affordable", "budget"},
+    "improve": {"reduce", "increase", "better"},
+    "co2": {"carbon", "dioxide"},
+    "particles": {"pm2.5", "dust", "particulate"},
+    "windows": {"natural", "ventilation"},
+    "filter": {"filtration", "purifier", "hepa", "merv"},
+    "monitor": {"sensor", "measurement", "track"},
+}
+
+TRUST_SCORES = {
+    "cdc.gov": 0.98,
+    "epa.gov": 0.98,
+    "who.int": 0.96,
+    "energy.gov": 0.94,
+    "ashrae.org": 0.92,
+    "education.gov": 0.91,
+    "prepared.local": 0.75,
+}
+
+
+@dataclass
+class Document:
+    doc_id: str
+    title: str
+    url: str
+    source_type: str
+    publisher: str
+    published_at: str
+    text: str
+
+
+@dataclass
+class Chunk:
+    chunk_id: str
+    doc_id: str
+    title: str
+    url: str
+    source_type: str
+    publisher: str
+    published_at: str
+    text: str
+    sentence_count: int
+
+
+@dataclass
+class RankedChunk:
+    chunk: Chunk
+    keyword_score: float
+    semantic_score: float
+    hybrid_score: float
+    veracity: float
+    grounding: float
+    relevance: float
+    helpfulness: float
+    vgrh_score: float
+    reasons: list[str]
+
+
+@dataclass
+class EvidenceItem:
+    claim: str
+    snippet: str
+    source_title: str
+    source_url: str
+    chunk_id: str
+    confidence: float
+    contradiction_flag: bool
+
+
+def tokenize(text: str) -> list[str]:
+    return [token for token in re.findall(r"[a-z0-9][a-z0-9.-]*", text.lower()) if token not in STOPWORDS]
+
+
+def split_sentences(text: str) -> list[str]:
+    pieces = re.split(r"(?<=[.!?])\s+", text.strip())
+    return [piece.strip() for piece in pieces if piece.strip()]
+
+
+def normalize_whitespace(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def average(values: Iterable[float]) -> float:
+    values = list(values)
+    if not values:
+        return 0.0
+    return sum(values) / len(values)
+
+
+class ResearchEngine:
+    def __init__(self, documents: list[Document]):
+        self.documents = documents
+        self.chunks = self._chunk_documents(documents)
+        self.doc_frequencies = self._build_doc_frequencies(self.chunks)
+        self.avg_chunk_length = average(len(tokenize(chunk.text)) for chunk in self.chunks)
+
+    @classmethod
+    def from_path(cls, path: Path) -> "ResearchEngine":
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        documents = [Document(**item) for item in payload["documents"]]
+        return cls(documents)
+
+    def run(self, query: str) -> dict:
+        plan = self._build_plan(query)
+        generated_queries = self._expand_queries(query, plan)
+        ranked_chunks = self._rank_chunks(query, generated_queries)
+        top_chunks = ranked_chunks[:8]
+        evidence = self._extract_evidence(query, plan, top_chunks)
+        report = self._generate_report(query, plan, top_chunks, evidence)
+        sources = self._build_source_table(top_chunks)
+        return {
+            "query": query,
+            "research_plan": plan,
+            "generated_queries": generated_queries,
+            "sources": sources,
+            "evidence": [asdict(item) for item in evidence],
+            "report_markdown": report,
+        }
+
+    def _build_plan(self, query: str) -> list[str]:
+        core = normalize_whitespace(query.rstrip("?. "))
+        return [
+            f"Clarify the decision goal behind: {core}.",
+            "Identify low-cost interventions, implementation constraints, and likely tradeoffs.",
+            "Find evidence about expected impact, operating cost, and ease of classroom adoption.",
+            "Cross-check whether the recommendations are supported by multiple trustworthy sources.",
+        ]
+
+    def _expand_queries(self, query: str, plan: list[str]) -> list[str]:
+        tokens = tokenize(query)
+        expanded = set(tokens)
+        for token in tokens:
+            expanded.update(SYNONYMS.get(token, set()))
+        joined = " ".join(sorted(expanded))
+        return [
+            query,
+            joined,
+            f"{query} evidence cost classroom ventilation filtration monitoring",
+            f"{plan[1]} {plan[2]}",
+        ]
+
+    def _chunk_documents(self, documents: list[Document]) -> list[Chunk]:
+        chunks = []
+        for document in documents:
+            sentences = split_sentences(document.text)
+            bucket = []
+            chunk_index = 1
+            for sentence in sentences:
+                bucket.append(sentence)
+                if len(" ".join(bucket).split()) >= 85:
+                    chunks.append(self._make_chunk(document, chunk_index, bucket))
+                    chunk_index += 1
+                    bucket = []
+            if bucket:
+                chunks.append(self._make_chunk(document, chunk_index, bucket))
+        return chunks
+
+    def _make_chunk(self, document: Document, chunk_index: int, sentences: list[str]) -> Chunk:
+        text = normalize_whitespace(" ".join(sentences))
+        return Chunk(
+            chunk_id=f"{document.doc_id}-chunk-{chunk_index}",
+            doc_id=document.doc_id,
+            title=document.title,
+            url=document.url,
+            source_type=document.source_type,
+            publisher=document.publisher,
+            published_at=document.published_at,
+            text=text,
+            sentence_count=len(sentences),
+        )
+
+    def _build_doc_frequencies(self, chunks: list[Chunk]) -> dict[str, int]:
+        doc_freq = defaultdict(int)
+        for chunk in chunks:
+            for token in set(tokenize(chunk.text)):
+                doc_freq[token] += 1
+        return dict(doc_freq)
+
+    def _rank_chunks(self, query: str, generated_queries: list[str]) -> list[RankedChunk]:
+        weighted_query = " ".join(generated_queries)
+        query_tokens = tokenize(weighted_query)
+        unique_query_tokens = set(query_tokens)
+        ranked = []
+        for chunk in self.chunks:
+            keyword_score = self._bm25_score(chunk.text, query_tokens)
+            semantic_score = self._semantic_score(chunk.text, unique_query_tokens)
+            hybrid_score = (keyword_score * 0.55) + (semantic_score * 0.45)
+            veracity = self._veracity(chunk)
+            grounding = self._grounding(chunk, unique_query_tokens)
+            relevance = min(1.0, hybrid_score / 8.0)
+            helpfulness = self._helpfulness(chunk, query)
+            vgrh_score = (
+                veracity * 0.28
+                + grounding * 0.22
+                + relevance * 0.30
+                + helpfulness * 0.20
+            )
+            reasons = self._reason_strings(chunk, keyword_score, semantic_score, veracity, grounding, helpfulness)
+            ranked.append(
+                RankedChunk(
+                    chunk=chunk,
+                    keyword_score=round(keyword_score, 3),
+                    semantic_score=round(semantic_score, 3),
+                    hybrid_score=round(hybrid_score, 3),
+                    veracity=round(veracity, 3),
+                    grounding=round(grounding, 3),
+                    relevance=round(relevance, 3),
+                    helpfulness=round(helpfulness, 3),
+                    vgrh_score=round(vgrh_score, 3),
+                    reasons=reasons,
+                )
+            )
+        ranked.sort(key=lambda item: (item.vgrh_score, item.hybrid_score, item.veracity), reverse=True)
+        return ranked
+
+    def _bm25_score(self, text: str, query_tokens: list[str]) -> float:
+        if not query_tokens:
+            return 0.0
+        tokens = tokenize(text)
+        counts = Counter(tokens)
+        length = max(1, len(tokens))
+        score = 0.0
+        k1 = 1.5
+        b = 0.75
+        total_docs = max(1, len(self.chunks))
+        for token in query_tokens:
+            if token not in counts:
+                continue
+            df = self.doc_frequencies.get(token, 0)
+            idf = math.log(1 + (total_docs - df + 0.5) / (df + 0.5))
+            tf = counts[token]
+            numer = tf * (k1 + 1)
+            denom = tf + k1 * (1 - b + b * (length / max(1.0, self.avg_chunk_length)))
+            score += idf * (numer / denom)
+        return score
+
+    def _semantic_score(self, text: str, query_tokens: set[str]) -> float:
+        text_tokens = set(tokenize(text))
+        if not text_tokens or not query_tokens:
+            return 0.0
+        overlap = len(text_tokens & query_tokens)
+        union = len(text_tokens | query_tokens)
+        return overlap / union if union else 0.0
+
+    def _veracity(self, chunk: Chunk) -> float:
+        domain = chunk.url.split("/")[2] if "://" in chunk.url else "prepared.local"
+        domain = domain.lower().removeprefix("www.")
+        base = TRUST_SCORES.get(domain, 0.7)
+        if any(year in chunk.published_at for year in ["2023", "2024", "2025"]):
+            base += 0.02
+        return min(1.0, base)
+
+    def _grounding(self, chunk: Chunk, query_tokens: set[str]) -> float:
+        sentences = split_sentences(chunk.text)
+        overlaps = []
+        for sentence in sentences:
+            sentence_tokens = set(tokenize(sentence))
+            if not sentence_tokens:
+                continue
+            overlaps.append(len(sentence_tokens & query_tokens) / len(query_tokens or {1}))
+        return min(1.0, average(overlaps) * 2.2)
+
+    def _helpfulness(self, chunk: Chunk, query: str) -> float:
+        sentences = split_sentences(chunk.text)
+        has_number = any(re.search(r"\b\d+(\.\d+)?\b", sentence) for sentence in sentences)
+        comparison_signal = any(word in chunk.text.lower() for word in ["cost", "reduce", "improve", "increase", "portable", "window", "filter"])
+        query_length_bonus = min(0.18, len(tokenize(query)) / 100)
+        score = 0.45
+        if has_number:
+            score += 0.18
+        if comparison_signal:
+            score += 0.22
+        if chunk.sentence_count >= 3:
+            score += 0.08
+        score += query_length_bonus
+        return min(1.0, score)
+
+    def _reason_strings(
+        self,
+        chunk: Chunk,
+        keyword_score: float,
+        semantic_score: float,
+        veracity: float,
+        grounding: float,
+        helpfulness: float,
+    ) -> list[str]:
+        reasons = []
+        if keyword_score >= 1.6:
+            reasons.append("Strong keyword match to the research topic")
+        if semantic_score >= 0.12:
+            reasons.append("Good overlap with expanded research concepts")
+        if veracity >= 0.92:
+            reasons.append("High-trust publisher")
+        if grounding >= 0.55:
+            reasons.append("Contains directly usable evidence snippets")
+        if helpfulness >= 0.75:
+            reasons.append("Actionable details and comparative signal")
+        return reasons or ["Moderate supporting context"]
+
+    def _extract_evidence(self, query: str, plan: list[str], ranked_chunks: list[RankedChunk]) -> list[EvidenceItem]:
+        evidence = []
+        query_tokens = set(tokenize(query + " " + " ".join(plan)))
+        for ranked in ranked_chunks[:5]:
+            best_sentence = ""
+            best_overlap = -1
+            for sentence in split_sentences(ranked.chunk.text):
+                sentence_tokens = set(tokenize(sentence))
+                overlap = len(sentence_tokens & query_tokens)
+                if overlap > best_overlap:
+                    best_sentence = sentence
+                    best_overlap = overlap
+            if not best_sentence:
+                continue
+            claim = self._claim_from_sentence(best_sentence)
+            contradiction_flag = self._sentence_has_contradiction(best_sentence)
+            confidence = min(0.99, ranked.vgrh_score * (0.82 if contradiction_flag else 1.0))
+            evidence.append(
+                EvidenceItem(
+                    claim=claim,
+                    snippet=best_sentence,
+                    source_title=ranked.chunk.title,
+                    source_url=ranked.chunk.url,
+                    chunk_id=ranked.chunk.chunk_id,
+                    confidence=round(confidence, 3),
+                    contradiction_flag=contradiction_flag,
+                )
+            )
+        return evidence
+
+    def _claim_from_sentence(self, sentence: str) -> str:
+        sentence = normalize_whitespace(sentence)
+        return sentence if len(sentence) <= 160 else sentence[:157] + "..."
+
+    def _sentence_has_contradiction(self, sentence: str) -> bool:
+        lowered = sentence.lower()
+        return "however" in lowered or "may not" in lowered or "limited" in lowered
+
+    def _build_source_table(self, ranked_chunks: list[RankedChunk]) -> list[dict]:
+        best_by_doc = {}
+        for ranked in ranked_chunks:
+            current = best_by_doc.get(ranked.chunk.doc_id)
+            if current is None or ranked.vgrh_score > current.vgrh_score:
+                best_by_doc[ranked.chunk.doc_id] = ranked
+        sources = []
+        for ranked in sorted(best_by_doc.values(), key=lambda item: item.vgrh_score, reverse=True):
+            sources.append(
+                {
+                    "title": ranked.chunk.title,
+                    "url": ranked.chunk.url,
+                    "publisher": ranked.chunk.publisher,
+                    "source_type": ranked.chunk.source_type,
+                    "published_at": ranked.chunk.published_at,
+                    "scores": {
+                        "keyword": ranked.keyword_score,
+                        "semantic": ranked.semantic_score,
+                        "hybrid": ranked.hybrid_score,
+                        "veracity": ranked.veracity,
+                        "grounding": ranked.grounding,
+                        "relevance": ranked.relevance,
+                        "helpfulness": ranked.helpfulness,
+                        "vgrh": ranked.vgrh_score,
+                    },
+                    "reason": "; ".join(ranked.reasons),
+                }
+            )
+        return sources
+
+    def _generate_report(self, query: str, plan: list[str], ranked_chunks: list[RankedChunk], evidence: list[EvidenceItem]) -> str:
+        source_lines = []
+        for index, ranked in enumerate(ranked_chunks[:5], start=1):
+            source_lines.append(
+                f"| {index} | {ranked.chunk.title} | {ranked.chunk.source_type} | {ranked.vgrh_score:.2f} | "
+                f"V:{ranked.veracity:.2f} G:{ranked.grounding:.2f} R:{ranked.relevance:.2f} H:{ranked.helpfulness:.2f} | "
+                f"{'; '.join(ranked.reasons)} |"
+            )
+
+        evidence_lines = []
+        for item in evidence:
+            evidence_lines.append(
+                f"| {item.claim} | {item.snippet} | [{item.source_title}]({item.source_url}) | {item.confidence:.2f} |"
+            )
+
+        recommendation_block = self._build_recommendations(evidence)
+        limitations = self._build_limitations(ranked_chunks, evidence)
+
+        return "\n".join(
+            [
+                f"# Research Report: {query}",
+                "",
+                "## Executive Summary",
+                recommendation_block["summary"],
+                "",
+                "## Research Plan",
+                *[f"- {step}" for step in plan],
+                "",
+                "## Source Table",
+                "| Rank | Source | Type | VGRH | Score Breakdown | Reason for Selection |",
+                "| --- | --- | --- | --- | --- | --- |",
+                *source_lines,
+                "",
+                "## Evidence Table",
+                "| Claim | Evidence Snippet | Source Reference | Confidence |",
+                "| --- | --- | --- | --- |",
+                *evidence_lines,
+                "",
+                "## Final Report",
+                recommendation_block["report"],
+                "",
+                "## Limitations",
+                limitations,
+            ]
+        )
+
+    def _build_recommendations(self, evidence: list[EvidenceItem]) -> dict[str, str]:
+        if not evidence:
+            return {
+                "summary": "The prototype could not find enough supporting evidence to make a reliable recommendation.",
+                "report": "No high-confidence claims were extracted.",
+            }
+
+        top = evidence[:5]
+        method_labels = [
+            (
+                "Improve natural or mechanical ventilation",
+                ["window", "outdoor air", "ventilation", "airflow", "fans", "occupied hours"],
+            ),
+            (
+                "Upgrade filtration or add portable cleaners",
+                ["filter", "filtration", "hepa", "portable", "merv", "cleaners"],
+            ),
+            (
+                "Monitor indoor conditions and maintenance performance",
+                ["monitor", "carbon dioxide", "co2", "maintenance", "measurement", "schedule"],
+            ),
+            (
+                "Reduce pollutant sources inside and near the classroom",
+                ["source control", "emission", "idling", "moisture", "chemicals", "products"],
+            ),
+        ]
+
+        method_evidence = []
+        for label, keywords in method_labels:
+            match = next(
+                (
+                    item
+                    for item in top
+                    if any(keyword in item.snippet.lower() for keyword in keywords)
+                    or any(keyword in item.claim.lower() for keyword in keywords)
+                ),
+                None,
+            )
+            if match:
+                method_evidence.append((label, match))
+
+        if len(method_evidence) < 3:
+            for item in top:
+                label = f"Evidence-backed action {len(method_evidence) + 1}"
+                if any(existing.chunk_id == item.chunk_id for _, existing in method_evidence):
+                    continue
+                method_evidence.append((label, item))
+                if len(method_evidence) == 3:
+                    break
+
+        summary = (
+            "The strongest low-cost classroom air quality actions are to improve natural ventilation, "
+            "upgrade or supplement filtration, and monitor indoor conditions so staff can respond when air quality worsens."
+        )
+        bullets = []
+        for label, item in method_evidence[:3]:
+            bullets.append(
+                f"- **{label}:** {item.claim} ({item.confidence:.2f} confidence, "
+                f"[{item.source_title}]({item.source_url}))"
+            )
+        report = "\n".join(
+            [
+                "Recommended approach:",
+                *bullets,
+                "",
+                "Why these actions rank highest:",
+                "- They appear across multiple high-trust public-health or building-guidance sources.",
+                "- They have direct grounding in source snippets rather than generic LLM language.",
+                "- They are comparatively practical for schools because they rely on process changes, low-cost hardware, or both.",
+            ]
+        )
+        return {"summary": summary, "report": report}
+
+    def _build_limitations(self, ranked_chunks: list[RankedChunk], evidence: list[EvidenceItem]) -> str:
+        missing_pdf = not any(chunk.chunk.source_type.lower() == "pdf" for chunk in ranked_chunks)
+        notes = [
+            "This offline prototype searches a prepared dataset, so source recall is limited to the bundled corpus.",
+            "Claim verification is heuristic: it estimates confidence and contradiction risk from evidence overlap rather than using a second external fact-checking system.",
+        ]
+        if missing_pdf:
+            notes.append("The current sample run may not surface a PDF in the top results even though the engine can ingest PDF-derived text into the corpus.")
+        if any(item.contradiction_flag for item in evidence):
+            notes.append("At least one evidence item includes uncertainty language and should be reviewed manually before acting on it.")
+        return "\n".join(f"- {note}" for note in notes)

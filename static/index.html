@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Rootstock Research Engine</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <main class="shell">
+      <section class="hero">
+        <p class="eyebrow">Rootstock Hackathon Prototype</p>
+        <h1>Agentic Deep Research Engine</h1>
+        <p class="lede">
+          A traceable research workflow with planning, source discovery, hybrid retrieval,
+          VGRH ranking, evidence extraction, and a cited final report.
+        </p>
+      </section>
+
+      <section class="panel query-panel">
+        <label for="query">Research query</label>
+        <textarea id="query" rows="4">Compare three low-cost methods for improving air quality in classrooms.</textarea>
+        <div class="actions">
+          <button id="runButton">Run Research</button>
+          <span id="status">Ready</span>
+        </div>
+      </section>
+
+      <section class="grid">
+        <article class="panel">
+          <h2>Research Plan</h2>
+          <ol id="plan"></ol>
+        </article>
+
+        <article class="panel">
+          <h2>Generated Queries</h2>
+          <ul id="queries" class="chips"></ul>
+        </article>
+      </section>
+
+      <section class="panel">
+        <h2>Ranked Sources</h2>
+        <div id="sources" class="cards"></div>
+      </section>
+
+      <section class="grid">
+        <article class="panel">
+          <h2>Evidence</h2>
+          <div id="evidence" class="cards"></div>
+        </article>
+
+        <article class="panel report-panel">
+          <h2>Report</h2>
+          <pre id="report"></pre>
+        </article>
+      </section>
+    </main>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

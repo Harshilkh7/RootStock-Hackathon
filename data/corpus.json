@@ -1,0 +1,67 @@
+{
+  "documents": [
+    {
+      "doc_id": "epa-iaq-tools",
+      "title": "EPA Indoor Air Quality Tools for Schools",
+      "url": "https://www.epa.gov/iaq-schools",
+      "source_type": "web",
+      "publisher": "US EPA",
+      "published_at": "2024-03-12",
+      "text": "EPA guidance for schools says indoor air quality improves when ventilation is maintained, filters are replaced on schedule, and occupant activities that add pollutants are controlled. Opening windows and doors can improve outdoor air exchange when weather and safety permit, especially in rooms with persistent odors or elevated carbon dioxide. Low-cost actions include changing HVAC filters to the highest compatible efficiency, keeping vents clear, cleaning with lower-emission products, and using portable air cleaners in rooms with recurring particle problems. Schools should monitor comfort complaints, moisture, and pollutant sources because poor air quality reduces concentration and can worsen asthma symptoms."
+    },
+    {
+      "doc_id": "cdc-ventilation-schools",
+      "title": "CDC Ventilation in Buildings for Schools and Childcare",
+      "url": "https://www.cdc.gov/air/ventilation-buildings.html",
+      "source_type": "web",
+      "publisher": "US CDC",
+      "published_at": "2024-08-20",
+      "text": "CDC building guidance explains that clean indoor air depends on bringing in outdoor air, improving air filtration, and reducing airborne contaminants at the source. For classrooms, practical low-cost steps include opening windows when conditions allow, using fans carefully to support airflow direction, and verifying that HVAC systems are operating during occupied hours. Portable HEPA cleaners can reduce particles in rooms with limited mechanical ventilation. Carbon dioxide monitors do not clean air directly, but they help staff identify spaces that need more ventilation or lower occupancy."
+    },
+    {
+      "doc_id": "who-indoor-air",
+      "title": "WHO Indoor Air Quality and Ventilation Summary",
+      "url": "https://www.who.int/teams/environment-climate-change-and-health/air-quality-and-health",
+      "source_type": "web",
+      "publisher": "World Health Organization",
+      "published_at": "2023-11-02",
+      "text": "WHO notes that indoor air pollution can come from outdoor particles, combustion sources, moisture, and inadequate ventilation. Interventions with broad public-health value include reducing indoor pollutant sources, increasing ventilation, and improving filtration. Monitoring and maintenance matter because equipment that is not serviced may fail to deliver the expected air quality benefit. Schools should combine technical controls with operating practices so improvements are sustained rather than one-time fixes."
+    },
+    {
+      "doc_id": "doe-k12-ventilation",
+      "title": "DOE Efficient and Healthy Schools Ventilation Playbook",
+      "url": "https://www.energy.gov/eere/buildings/efficient-and-healthy-schools",
+      "source_type": "pdf",
+      "publisher": "US Department of Energy",
+      "published_at": "2024-01-10",
+      "text": "The Department of Energy ventilation playbook for K-12 facilities describes phased interventions for improving air quality without requiring a major capital project. Immediate actions include checking schedules so fans run before and during occupancy, replacing loaded filters, measuring pressure drop to confirm compatibility, and using portable cleaners in high-risk rooms. Medium-term actions include sealing obvious leaks and balancing airflow. The playbook emphasizes that low-cost monitoring helps schools prioritize which rooms need action first."
+    },
+    {
+      "doc_id": "ashrae-schools",
+      "title": "ASHRAE Guidance for Classroom Ventilation and Filtration",
+      "url": "https://www.ashrae.org/technical-resources/filtration-disinfection",
+      "source_type": "web",
+      "publisher": "ASHRAE",
+      "published_at": "2023-09-18",
+      "text": "ASHRAE guidance says classrooms benefit from a layered approach: source control, ventilation, filtration, and verification. Upgrading to the highest MERV filter that the system can support is often more affordable than equipment replacement. Portable HEPA cleaners are most useful where airflow is weak or occupant density is high. Ventilation changes should be verified because more airflow alone may not be enough if filters are poorly fitted or maintenance is delayed."
+    },
+    {
+      "doc_id": "education-co2-brief",
+      "title": "School Operations Brief on CO2 Monitoring",
+      "url": "https://www.ed.gov/prepared.local/co2-monitoring-brief",
+      "source_type": "dataset",
+      "publisher": "Prepared Local Brief",
+      "published_at": "2024-05-01",
+      "text": "A school operations brief found that low-cost carbon dioxide monitors helped staff identify classrooms that routinely stayed poorly ventilated during occupied periods. The monitors did not solve the problem by themselves, but they improved decision making about window opening, fan use, and portable cleaner placement. Costs were lower than full building retrofits, though staff still needed a response plan for what to do when measurements were high. Results were strongest when monitoring was paired with maintenance checks and teacher guidance."
+    },
+    {
+      "doc_id": "classroom-cleaning-practices",
+      "title": "Low-Emission Cleaning and Source Control in Classrooms",
+      "url": "https://www.epa.gov/indoor-air-quality-iaq/source-control-classrooms",
+      "source_type": "web",
+      "publisher": "US EPA",
+      "published_at": "2023-06-05",
+      "text": "Source control can be a low-cost way to improve classroom air quality. EPA school guidance highlights storing chemicals correctly, reducing idling near air intakes, fixing moisture problems early, and selecting lower-emission products when possible. These actions are usually cheaper than mechanical upgrades and can reduce odors and irritants quickly. However, source control may not be enough on its own in rooms that also have poor ventilation or high particle loads."
+    }
+  ]
+}
