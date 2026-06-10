@@ -62,6 +62,32 @@ TRUST_SCORES = {
     "prepared.local": 0.75,
 }
 
+MIN_GROUNDING_THRESHOLD = 0.22
+MAX_SUPPORT_CONFIDENCE_BONUS = 0.09
+SUPPORT_CONFIDENCE_STEP = 0.03
+SUPPORT_SIMILARITY_THRESHOLD = 0.08
+CLAIM_SIGNATURE_MIN_TOKEN_LENGTH = 3
+CLAIM_SIGNATURE_TOKEN_LIMIT = 7
+CLAIM_SIGNATURE_FALLBACK_CHARS = 32
+GENERIC_QUERY_TERMS = {
+    "compare",
+    "method",
+    "methods",
+    "study",
+    "analysis",
+    "research",
+    "one",
+    "two",
+    "three",
+    "four",
+    "five",
+    "six",
+    "seven",
+    "eight",
+    "nine",
+    "ten",
+}
+
 
 @dataclass
 class Document:
@@ -174,23 +200,22 @@ class ResearchEngine:
         follow_ups = []
 
         text_blob = " ".join(chunk.chunk.text.lower() for chunk in initial_top)
-        coverage_terms = {
-            "ventilation": ["ventilation", "window", "airflow", "outdoor air"],
-            "filtration": ["filter", "filtration", "merv", "hepa", "cleaner"],
-            "monitoring": ["monitor", "sensor", "co2", "measurement", "maintenance"],
-        }
-        missing_dimensions = [
-            name
-            for name, terms in coverage_terms.items()
-            if not any(term in text_blob for term in terms)
-        ]
+        focus_terms = []
+        for token in tokenize(query):
+            cleaned = token.strip(".-")
+            if len(cleaned) <= CLAIM_SIGNATURE_MIN_TOKEN_LENGTH or cleaned in GENERIC_QUERY_TERMS:
+                continue
+            focus_terms.append(cleaned)
+            if len(focus_terms) == 8:
+                break
+        missing_dimensions = [term for term in focus_terms if term not in text_blob]
 
         avg_grounding = average(chunk.grounding for chunk in initial_top)
         if missing_dimensions:
             follow_ups.append(
-                f"{query} focused comparison for {' '.join(missing_dimensions)} in classrooms with practical implementation details"
+                f"{query} focused comparison for {' '.join(missing_dimensions)} with practical implementation details"
             )
-        if avg_grounding < 0.22:
+        if avg_grounding < MIN_GROUNDING_THRESHOLD:
             follow_ups.append(
                 f"{query} include quantified impact cost and maintenance evidence with specific metrics"
             )
@@ -401,8 +426,6 @@ class ResearchEngine:
     def _extract_evidence(self, query: str, plan: list[str], ranked_chunks: list[RankedChunk]) -> list[EvidenceItem]:
         evidence = []
         query_tokens = set(tokenize(query + " " + " ".join(plan)))
-        grouped_support = defaultdict(set)
-        grouped_contradiction = defaultdict(bool)
         chosen_sentences = []
         for ranked in ranked_chunks[:8]:
             best_sentence = ""
@@ -415,18 +438,24 @@ class ResearchEngine:
                     best_overlap = overlap
             if not best_sentence:
                 continue
-            signature = self._claim_signature(best_sentence)
-            grouped_support[signature].add(ranked.chunk.doc_id)
-            grouped_contradiction[signature] = grouped_contradiction[signature] or self._sentence_has_contradiction(best_sentence)
-            chosen_sentences.append((ranked, best_sentence, signature))
+            signature = self._claim_signature(best_sentence, query_tokens)
+            sentence_token_set = set(self._normalize_token_for_signature(token) for token in tokenize(best_sentence))
+            chosen_sentences.append((ranked, best_sentence, signature, sentence_token_set))
 
-        for ranked, best_sentence, signature in chosen_sentences[:6]:
+        for ranked, best_sentence, signature, sentence_token_set in chosen_sentences[:6]:
             claim = self._claim_from_sentence(best_sentence)
-            contradiction_flag = grouped_contradiction[signature]
-            support_count = len(grouped_support[signature])
+            support_docs = set()
+            contradiction_flag = False
+            for other_ranked, other_sentence, other_signature, other_token_set in chosen_sentences:
+                union = sentence_token_set | other_token_set
+                similarity = (len(sentence_token_set & other_token_set) / len(union)) if union else 0.0
+                if signature == other_signature or similarity >= SUPPORT_SIMILARITY_THRESHOLD:
+                    support_docs.add(other_ranked.chunk.doc_id)
+                    contradiction_flag = contradiction_flag or self._sentence_has_contradiction(other_sentence)
+            support_count = len(support_docs)
             verification = "verified" if support_count >= 2 and not contradiction_flag else "needs_review"
             confidence = ranked.vgrh_score
-            confidence += min(0.09, support_count * 0.03)
+            confidence += min(MAX_SUPPORT_CONFIDENCE_BONUS, support_count * SUPPORT_CONFIDENCE_STEP)
             if contradiction_flag:
                 confidence *= 0.82
             confidence = min(0.99, confidence)
@@ -461,19 +490,29 @@ class ResearchEngine:
         ]
         return any(term in lowered for term in contradiction_terms)
 
-    def _claim_signature(self, sentence: str) -> str:
-        lowered = sentence.lower()
-        concept_groups = {
-            "ventilation_action": ["ventilation", "window", "airflow", "outdoor air", "fresh air"],
-            "filtration_action": ["filter", "filtration", "hepa", "merv", "cleaner", "purifier"],
-            "monitoring_action": ["monitor", "sensor", "co2", "measurement", "maintenance"],
-            "source_control_action": ["source control", "idling", "pollutant", "emission", "chemical", "moisture"],
-        }
-        for signature, terms in concept_groups.items():
-            if any(term in lowered for term in terms):
-                return signature
-        tokens = [token for token in tokenize(sentence) if len(token) > 3]
-        return " ".join(tokens[:7]) if tokens else sentence[:32].lower()
+    def _claim_signature(self, sentence: str, query_tokens: set[str] | None = None) -> str:
+        tokens = [self._normalize_token_for_signature(token) for token in tokenize(sentence)]
+        tokens = [token for token in tokens if len(token) > CLAIM_SIGNATURE_MIN_TOKEN_LENGTH and token not in GENERIC_QUERY_TERMS]
+        if query_tokens:
+            anchored = sorted(set(tokens) & query_tokens)
+            if len(anchored) >= 2:
+                return " ".join(anchored[:CLAIM_SIGNATURE_TOKEN_LIMIT])
+        signature_tokens = sorted(set(tokens))
+        return (
+            " ".join(signature_tokens[:CLAIM_SIGNATURE_TOKEN_LIMIT])
+            if signature_tokens
+            else sentence[:CLAIM_SIGNATURE_FALLBACK_CHARS].lower()
+        )
+
+    def _normalize_token_for_signature(self, token: str) -> str:
+        token = token.strip(".-")
+        if token.endswith("ing") and len(token) > 6:
+            return token[:-3]
+        if token.endswith("es") and len(token) > 5:
+            return token[:-2]
+        if token.endswith("s") and len(token) > 4:
+            return token[:-1]
+        return token
 
     def _build_source_table(self, ranked_chunks: list[RankedChunk]) -> list[dict]:
         best_by_doc = {}
@@ -657,11 +696,87 @@ class ResearchEngine:
         return "\n".join(f"- {note}" for note in notes)
 
     def _to_html_report(self, query: str, markdown_report: str) -> str:
-        escaped_report = escape(markdown_report)
+        rendered = self._markdown_to_html(markdown_report)
         escaped_query = escape(query)
         return (
             "<!doctype html><html><head><meta charset='utf-8'><title>Research Report</title>"
             "<style>body{font-family:Arial,sans-serif;max-width:980px;margin:24px auto;padding:0 16px;line-height:1.5}"
-            "pre{white-space:pre-wrap;background:#f6f8fa;border:1px solid #d0d7de;border-radius:8px;padding:16px}</style>"
-            f"</head><body><h1>Research Report</h1><h2>{escaped_query}</h2><pre>{escaped_report}</pre></body></html>"
+            "table{border-collapse:collapse;width:100%;margin:10px 0}th,td{border:1px solid #d0d7de;padding:8px;text-align:left}"
+            "code{background:#f6f8fa;padding:2px 4px;border-radius:4px}</style>"
+            f"</head><body><h1>Research Report</h1><h2>{escaped_query}</h2>{rendered}</body></html>"
         )
+
+    def _markdown_to_html(self, markdown_text: str) -> str:
+        lines = markdown_text.splitlines()
+        output = []
+        in_list = False
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            stripped = line.strip()
+            if not stripped:
+                if in_list:
+                    output.append("</ul>")
+                    in_list = False
+                i += 1
+                continue
+
+            if stripped.startswith("|") and i + 1 < len(lines) and lines[i + 1].strip().startswith("| ---"):
+                if in_list:
+                    output.append("</ul>")
+                    in_list = False
+                headers = [self._render_markdown_inline(cell.strip()) for cell in stripped.strip("|").split("|")]
+                output.append("<table><thead><tr>" + "".join(f"<th>{cell}</th>" for cell in headers) + "</tr></thead><tbody>")
+                i += 2
+                while i < len(lines) and lines[i].strip().startswith("|"):
+                    cells = [self._render_markdown_inline(cell.strip()) for cell in lines[i].strip().strip("|").split("|")]
+                    output.append("<tr>" + "".join(f"<td>{cell}</td>" for cell in cells) + "</tr>")
+                    i += 1
+                output.append("</tbody></table>")
+                continue
+
+            if stripped.startswith("### "):
+                if in_list:
+                    output.append("</ul>")
+                    in_list = False
+                output.append(f"<h3>{escape(stripped[4:])}</h3>")
+            elif stripped.startswith("## "):
+                if in_list:
+                    output.append("</ul>")
+                    in_list = False
+                output.append(f"<h2>{escape(stripped[3:])}</h2>")
+            elif stripped.startswith("# "):
+                if in_list:
+                    output.append("</ul>")
+                    in_list = False
+                output.append(f"<h1>{escape(stripped[2:])}</h1>")
+            elif stripped.startswith("- "):
+                if not in_list:
+                    output.append("<ul>")
+                    in_list = True
+                output.append(f"<li>{self._render_markdown_inline(stripped[2:])}</li>")
+            else:
+                if in_list:
+                    output.append("</ul>")
+                    in_list = False
+                output.append(f"<p>{self._render_markdown_inline(stripped)}</p>")
+            i += 1
+
+        if in_list:
+            output.append("</ul>")
+        return "".join(output)
+
+    def _render_markdown_inline(self, text: str) -> str:
+        parts = []
+        last_index = 0
+        for match in re.finditer(r"\[([^\]]+)\]\((https?://[^)]+)\)", text):
+            start, end = match.span()
+            if start > last_index:
+                parts.append(escape(text[last_index:start]))
+            label = escape(match.group(1))
+            href = escape(match.group(2), quote=True)
+            parts.append(f"<a href=\"{href}\" target=\"_blank\" rel=\"noreferrer\">{label}</a>")
+            last_index = end
+        if last_index < len(text):
+            parts.append(escape(text[last_index:]))
+        return "".join(parts)

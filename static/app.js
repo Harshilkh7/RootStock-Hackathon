@@ -10,6 +10,7 @@ const sourcesList = document.getElementById("sources");
 const evidenceList = document.getElementById("evidence");
 const reportBlock = document.getElementById("report");
 let latestResult = null;
+const TRACE_QUERY_SEPARATOR = " | ";
 
 function renderList(container, items, ordered = false) {
   container.innerHTML = "";
@@ -41,11 +42,16 @@ function renderEvidence(evidence) {
   evidence.forEach((item) => {
     const card = document.createElement("article");
     card.className = "card";
+    const contradictionLabel = item.contradiction_flag ? " · uncertainty flagged" : "";
     card.innerHTML = `
       <h3>${item.claim}</h3>
       <p>${item.snippet}</p>
       <p><a href="${item.source_url}" target="_blank" rel="noreferrer">${item.source_title}</a></p>
-      <p><strong>Confidence:</strong> ${item.confidence.toFixed(2)} · <strong>Support:</strong> ${item.support_count} sources · <strong>Status:</strong> ${item.verification}${item.contradiction_flag ? " · uncertainty flagged" : ""}</p>
+      <p>
+        <strong>Confidence:</strong> ${item.confidence.toFixed(2)}
+        · <strong>Support:</strong> ${item.support_count} sources
+        · <strong>Status:</strong> ${item.verification}${contradictionLabel}
+      </p>
     `;
     evidenceList.appendChild(card);
   });
@@ -55,8 +61,11 @@ function renderLoopTrace(items) {
   loopTraceList.innerHTML = "";
   items.forEach((item) => {
     const node = document.createElement("li");
-    const addedQueries = item.added_queries.length ? item.added_queries.join(" | ") : "none";
-    node.textContent = `Iteration ${item.iteration}: ${item.note} (avg grounding ${item.avg_grounding}, added queries: ${addedQueries})`;
+    const addedQueries = item.added_queries.length ? item.added_queries.join(TRACE_QUERY_SEPARATOR) : "none";
+    node.textContent = [
+      `Iteration ${item.iteration}: ${item.note}`,
+      `(avg grounding ${item.avg_grounding}, added queries: ${addedQueries})`
+    ].join(" ");
     loopTraceList.appendChild(node);
   });
 }
