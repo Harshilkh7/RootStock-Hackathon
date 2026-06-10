@@ -5,9 +5,12 @@ import math
 import re
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
 from typing import Iterable
+from urllib.parse import quote, quote_plus, urlparse
+from urllib.request import Request, urlopen
 
 
 STOPWORDS = {
@@ -69,6 +72,9 @@ SUPPORT_SIMILARITY_THRESHOLD = 0.08
 CLAIM_SIGNATURE_MIN_TOKEN_LENGTH = 3
 CLAIM_SIGNATURE_TOKEN_LIMIT = 7
 CLAIM_SIGNATURE_FALLBACK_CHARS = 32
+LIVE_SEARCH_TIMEOUT_SECONDS = 8
+LIVE_DDG_RESULT_LIMIT = 5
+LIVE_WIKI_RESULT_LIMIT = 4
 GENERIC_QUERY_TERMS = {
     "compare",
     "method",
@@ -175,6 +181,13 @@ class ResearchEngine:
         return cls(documents)
 
     def run(self, query: str) -> dict:
+        live_documents = self._fetch_live_documents(query)
+        runtime_engine = self if not live_documents else ResearchEngine(self.documents + live_documents)
+        result = runtime_engine._run_pipeline(query)
+        result["live_documents_count"] = len(live_documents)
+        return result
+
+    def _run_pipeline(self, query: str) -> dict:
         plan = self._build_plan(query)
         generated_queries = self._expand_queries(query, plan)
         ranked_chunks = self._rank_chunks(query, generated_queries)
@@ -193,6 +206,117 @@ class ResearchEngine:
             "report_markdown": report,
             "report_html": self._to_html_report(query, report),
         }
+
+    def _fetch_live_documents(self, query: str) -> list[Document]:
+        live_documents = []
+        live_documents.extend(self._fetch_duckduckgo_documents(query))
+        live_documents.extend(self._fetch_wikipedia_documents(query))
+        deduped_by_url = {}
+        for document in live_documents:
+            if len(tokenize(document.text)) < 10:
+                continue
+            deduped_by_url.setdefault(document.url, document)
+        return list(deduped_by_url.values())
+
+    def _fetch_duckduckgo_documents(self, query: str) -> list[Document]:
+        endpoint = (
+            "https://api.duckduckgo.com/"
+            f"?q={quote_plus(query)}&format=json&no_html=1&skip_disambig=1"
+        )
+        payload = self._get_json(endpoint)
+        if not payload:
+            return []
+
+        candidates = []
+        if payload.get("AbstractURL") and payload.get("AbstractText"):
+            candidates.append(
+                {
+                    "title": payload.get("Heading") or payload.get("AbstractSource") or "DuckDuckGo result",
+                    "url": payload["AbstractURL"],
+                    "snippet": payload["AbstractText"],
+                }
+            )
+        for item in payload.get("RelatedTopics", []):
+            if isinstance(item, dict) and item.get("Topics"):
+                topic_items = item.get("Topics", [])
+            else:
+                topic_items = [item]
+            for topic in topic_items:
+                if not isinstance(topic, dict):
+                    continue
+                url = topic.get("FirstURL")
+                text = topic.get("Text")
+                if not url or not text:
+                    continue
+                title = text.split(" - ", 1)[0].strip() or "DuckDuckGo related result"
+                candidates.append({"title": title, "url": url, "snippet": text})
+
+        documents = []
+        for index, item in enumerate(candidates[:LIVE_DDG_RESULT_LIMIT], start=1):
+            publisher = self._domain_from_url(item["url"]) or "duckduckgo.com"
+            documents.append(
+                Document(
+                    doc_id=f"live-ddg-{index}",
+                    title=normalize_whitespace(item["title"]),
+                    url=item["url"],
+                    source_type="web_api",
+                    publisher=publisher,
+                    published_at=self._live_timestamp_label(),
+                    text=normalize_whitespace(f"{item['title']}. {item['snippet']}"),
+                )
+            )
+        return documents
+
+    def _fetch_wikipedia_documents(self, query: str) -> list[Document]:
+        search_url = (
+            "https://en.wikipedia.org/w/api.php?action=query&list=search&utf8=1&format=json"
+            f"&srlimit={LIVE_WIKI_RESULT_LIMIT}&srsearch={quote_plus(query)}"
+        )
+        payload = self._get_json(search_url)
+        search_items = ((payload or {}).get("query") or {}).get("search") or []
+        documents = []
+        for index, item in enumerate(search_items, start=1):
+            title = normalize_whitespace(str(item.get("title", "")).strip())
+            if not title:
+                continue
+            summary = self._get_json(f"https://en.wikipedia.org/api/rest_v1/page/summary/{quote(title, safe='')}")
+            snippet = normalize_whitespace(self._strip_html(str(item.get("snippet", ""))))
+            extract = normalize_whitespace(str((summary or {}).get("extract", "")).strip())
+            text = normalize_whitespace(f"{title}. {extract or snippet}")
+            url = ((summary or {}).get("content_urls") or {}).get("desktop", {}).get("page")
+            if not url:
+                url = f"https://en.wikipedia.org/wiki/{quote(title.replace(' ', '_'), safe='')}"
+            published_at = str((summary or {}).get("timestamp", "")).split("T", 1)[0] or self._live_timestamp_label()
+            documents.append(
+                Document(
+                    doc_id=f"live-wiki-{index}",
+                    title=title,
+                    url=url,
+                    source_type="web_api",
+                    publisher="wikipedia.org",
+                    published_at=published_at,
+                    text=text,
+                )
+            )
+        return documents
+
+    def _get_json(self, url: str) -> dict | None:
+        try:
+            request = Request(url, headers={"User-Agent": "RootstockResearchEngine/1.0"})
+            with urlopen(request, timeout=LIVE_SEARCH_TIMEOUT_SECONDS) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except Exception:
+            return None
+
+    def _domain_from_url(self, url: str) -> str:
+        domain = urlparse(url).netloc.lower().removeprefix("www.")
+        return domain
+
+    def _live_timestamp_label(self) -> str:
+        return datetime.now(timezone.utc).date().isoformat()
+
+    def _strip_html(self, text: str) -> str:
+        return re.sub(r"<[^>]+>", " ", text)
 
     def _iterative_research(
         self, query: str, ranked_chunks: list[RankedChunk], generated_queries: list[str]
@@ -687,7 +811,7 @@ class ResearchEngine:
     def _build_limitations(self, ranked_chunks: list[RankedChunk], evidence: list[EvidenceItem]) -> str:
         missing_pdf = not any(chunk.chunk.source_type.lower() == "pdf" for chunk in ranked_chunks)
         notes = [
-            "This offline prototype searches a prepared dataset, so source recall is limited to the bundled corpus.",
+            "Live web-search APIs are queried at runtime, but retrieval is best-effort and can degrade to local-corpus-only when external APIs are unavailable or rate-limited.",
             "Claim verification is heuristic: it estimates confidence and contradiction risk from evidence overlap rather than using a second external fact-checking system.",
         ]
         if missing_pdf:
